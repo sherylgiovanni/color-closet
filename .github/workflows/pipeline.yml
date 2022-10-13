@@ -1,0 +1,202 @@
+name: CD Pipeline
+
+on:
+  push:
+    branches: [ main, dev ]
+    paths-ignore:
+      - '.editorconfig'
+      - '.github/dependabot.yml'
+      - '.gitignore'
+      - 'README.md'
+      - 'src/__mocks__/**'
+      - 'src/jest.config.js'
+      - 'src/qaTest/**'
+      - 'src/test/**'
+env:
+  app_working_dir: './src'
+  FORCE_COLOR: 3
+  TF_IN_AUTOMATION: 'true'
+  tf_version: '1.0.2'
+  node_version: '14.x'
+
+jobs:
+  pipeline:
+    name: Pipeline
+    runs-on: ubuntu-latest
+    env:
+      TF_IN_AUTOMATION: 'true'
+    steps:
+      - name: Setup DEV Environment Variables # TODO replace <GITHUB_AWS_DEV_KEY_NAME>, <GITHUB_AWS_DEV_SECRET_NAME>, <APP_NAME>
+        if: github.ref == 'refs/heads/dev'
+        run: |
+          echo "aws_key=${{ secrets.byu_oit_fullstack_trn_key }}" >> $GITHUB_ENV
+          echo "aws_secret=${{ secrets.byu_oit_fullstack_trn_secret }}" >> $GITHUB_ENV
+          echo "std_change_key=${{ secrets.standard_change_sandbox_client_key }}" >> $GITHUB_ENV
+          echo "std_change_secret=${{ secrets.standard_change_sandbox_client_secret }}" >> $GITHUB_ENV
+          echo "tf_working_dir=./terraform/dev/app" >> $GITHUB_ENV
+          echo "api_base_url=https://api-sandbox.byu.edu" >> $GITHUB_ENV
+          echo "client_id_param=/sg738-fav-color-ui-dev/oauth_client_id" >> $GITHUB_ENV
+          echo "callback_url_param=/sg738-fav-color-ui-dev/callback_url" >> $GITHUB_ENV
+          echo "app_dynamics_key_param=/sg738-fav-color-ui-dev/app_dynamics_key" >> $GITHUB_ENV
+           echo "template_id=Codepipeline-Standard-Change" >> $GITHUB_ENV
+
+      - name: Setup PRD Environment Variables # TODO replace <GITHUB_AWS_PRD_KEY_NAME>, <GITHUB_AWS_PRD_SECRET_NAME>, <APP_NAME>, <STD_CHANGE_TEMPLATE_ID>
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "aws_key=${{ secrets.byu_oit_fullstack_trn_key }}" >> $GITHUB_ENV
+          echo "aws_secret=${{ secrets.byu_oit_fullstack_trn_secret }}" >> $GITHUB_ENV
+          echo "std_change_key=${{ secrets.standard_change_production_client_key }}" >> $GITHUB_ENV
+          echo "std_change_secret=${{ secrets.standard_change_production_client_secret }}" >> $GITHUB_ENV
+          echo "tf_working_dir=./terraform/prd/app" >> $GITHUB_ENV
+          echo "api_base_url=https://api.byu.edu" >> $GITHUB_ENV
+          echo "client_id_param=/sg738-fav-color-ui-prd/oauth_client_id" >> $GITHUB_ENV
+          echo "callback_url_param=/sg738-fav-color-ui-prd/callback_url" >> $GITHUB_ENV
+          echo "app_dynamics_key_param=/sg738-fav-color-ui-prd/app_dynamics_key" >> $GITHUB_ENV
+          echo "template_id=Codepipeline-Standard-Change" >> $GITHUB_ENV
+
+      - name: Check out
+        uses: actions/checkout@v2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ env.aws_key }}
+          aws-secret-access-key: ${{ env.aws_secret }}
+          aws-region: us-west-2
+
+      # TODO: Cause workflow to fail if parameter is not found.
+      - name: Grab SSM Params
+        id: ssm
+        run: |
+          echo "::set-output name=client_id::$(aws ssm get-parameter --name $client_id_param | jq -r .Parameter.Value)"
+          echo "::set-output name=callback_url::$(aws ssm get-parameter --name $callback_url_param | jq -r .Parameter.Value)"
+          # echo "::set-output name=app_dynamics_key::$(aws ssm get-parameter --name $app_dynamics_key_param | jq -r .Parameter.Value)"
+
+      - name: Setup Node
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ env.node_version }}
+
+      - uses: actions/cache@v2
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install
+        working-directory: ${{ env.app_working_dir }}
+        run: npm ci --prefer-offline
+
+      - name: Build
+        env:
+          NUXT_TELEMETRY_DISABLED: 1
+          NUXT_ENV_OAUTH_CLIENT_ID: ${{ steps.ssm.outputs.client_id }}
+          NUXT_ENV_OAUTH_CALLBACK_URL: ${{ steps.ssm.outputs.callback_url }}
+          NUXT_ENV_API_SERVER: ${{ env.api_base_url }}
+          # NUXT_ENV_APP_DYNAMICS_KEY: ${{ steps.ssm.outputs.app_dynamics_key }}
+        working-directory: ${{ env.app_working_dir }}
+        run: npm run build
+
+      - name: Test
+        working-directory: ${{ env.app_working_dir }}
+        run: npm run test -- --coverage
+
+      - name: CodeCov
+        uses: codecov/codecov-action@v2.0.2
+        if: ${{ github.actor != 'dependabot[bot]' }}
+        with:
+          token: ${{ secrets.codecov_token }}
+
+      - name: Lint
+        working-directory: ${{ env.app_working_dir }}
+        run: npm run lint
+
+      - name: Terraform Setup
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: ${{ env.tf_version }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.tf_working_dir }}
+        run: terraform init
+
+      - name: Terraform Format
+        working-directory: ${{ env.tf_working_dir }}
+        run: terraform fmt -check
+
+      - name: Terraform Plan
+        working-directory: ${{ env.tf_working_dir }}
+        id: plan
+        run: terraform plan -input=false -out=plan
+
+      - name: Analyze Terraform Plan
+        uses: byu-oit/github-action-tf-plan-analyzer@v2
+        with:
+          divvycloud-username: ${{ secrets.DIVVYCLOUD_USERNAME }}
+          divvycloud-password: ${{ secrets.DIVVYCLOUD_PASSWORD }}
+          working-directory: ${{ env.tf_working_dir }}
+          terraform-plan-file: plan
+
+      - name: Start Standard Change
+        uses: byu-oit/github-action-start-standard-change@v1
+        id: start-standard-change
+        with:
+          client-key: ${{ env.std_change_key }}
+          client-secret: ${{ env.std_change_secret }}
+          template-id: ${{ env.template_id }}
+
+      - name: Terraform Apply
+        working-directory: ${{ env.tf_working_dir }}
+        run: terraform apply plan
+
+      - name: Get Bucket name
+        id: s3_tf_outputs
+        working-directory: ${{ env.tf_working_dir }}
+        run: terraform output s3_bucket
+
+      - name: Copy dist to S3 site bucket
+        id: deploy
+        run: aws s3 sync ${{ env.app_working_dir }}/dist s3://${{ steps.s3_tf_outputs.outputs.stdout }}
+
+      - name: Get CloudFront distribution ID
+        id: cf_tf_outputs
+        working-directory: ${{ env.tf_working_dir }}
+        run: terraform output cf_distribution_id
+
+      - name: Invalidate CloudFront cache
+        run: aws cloudfront create-invalidation --path '/*' --distribution-id ${{ steps.cf_tf_outputs.outputs.stdout }}
+
+      - name: End Standard Change
+        uses: byu-oit/github-action-end-standard-change@v1
+        if: ${{ always() && steps.start-standard-change.outcome == 'success' }} # Run if RFC started, even if the deploy failed
+        with:
+          client-key: ${{ env.std_change_key }}
+          client-secret: ${{ env.std_change_secret }}
+          change-sys-id: ${{ steps.start-standard-change.outputs.change-sys-id }}
+          work-start: ${{ steps.start-standard-change.outputs.work-start }}
+          success: ${{ steps.deploy.outcome == 'success' }}
+
+      - name: Get Current Timestamp
+        id: date
+        run: echo "::set-output name=timestamp::$(date +'%Y-%m-%d_%H-%M-%S')"
+
+      - name: Create GitHub release
+        if: github.ref == 'refs/heads/main'
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.date.outputs.timestamp }}
+          release_name: Release ${{ steps.date.outputs.timestamp }}
+          draft: false
+          prerelease: true # TODO: Change when ready to release
+
+      - name: Send Slack Notification
+        uses: byu-oit/github-action-slack@v1
+        if: always()
+        with:
+          status: ${{ job.status }}
+          channel: '#custom-code-bots'
+          webhook-url: ${{ secrets.slack_webhook_url }}
